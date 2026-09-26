@@ -20,6 +20,12 @@ class Record:
 @dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
+@dataclass(frozen=True)
+class Handover:
+    id:int; outgoing_officer:str; incoming_officer:str; reservoir_level:float; personnel:str; note:Optional[str]; status:str; created_by:str; created_at:str; completed_at:Optional[str]
+@dataclass(frozen=True)
+class HandoverItem:
+    id:int; handover_id:int; item_id:int; item_version:int; item_status:str; decision:Optional[str]; reason:Optional[str]; decided_by:Optional[str]; decided_at:Optional[str]
 def require_text(value,field,max_length=2000):
     if not isinstance(value,str) or not value.strip(): raise ValidationError(f"{field}不能为空")
     value=value.strip()
@@ -36,3 +42,14 @@ def require_number(value,field,minimum=0.0):
     return number
 def ensure_role(role,allowed):
     if role not in allowed: raise PermissionDenied("当前角色无权执行该操作")
+def require_text_list(value,field,max_items=200,max_length=100):
+    if not isinstance(value,list) or not value: raise ValidationError(f"{field}必须是非空数组")
+    result=[]
+    for entry in value:
+        text=require_text(entry,field,max_length)
+        if text not in result: result.append(text)
+        if len(result)>max_items: raise ValidationError(f"{field}不能超过{max_items}项")
+    return result
+def require_id(value,field):
+    if isinstance(value,bool) or not isinstance(value,int) or value<1: raise ValidationError(f"{field}必须是正整数")
+    return value

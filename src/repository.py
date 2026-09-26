@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import (HANDOVER_DECISIONS, HANDOVER_STATES, ID_PREFIX, STATES,
+                    return_review_state)
 
 
 class Repository:
@@ -65,6 +66,34 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS handovers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    outgoing_officer TEXT NOT NULL,
+                    incoming_officer TEXT NOT NULL,
+                    reservoir_level REAL NOT NULL,
+                    personnel TEXT NOT NULL,
+                    note TEXT,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ('open','completed')),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS handover_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    handover_id INTEGER NOT NULL
+                        REFERENCES handovers(id) ON DELETE CASCADE,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    item_version INTEGER NOT NULL,
+                    item_status TEXT NOT NULL,
+                    decision TEXT CHECK(decision IS NULL OR decision IN ('accepted','returned')),
+                    reason TEXT,
+                    decided_by TEXT,
+                    decided_at TEXT,
+                    UNIQUE(handover_id, item_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_open_handover_item
+                    ON handover_items(item_id) WHERE decision IS NULL;
             """)
 
     @staticmethod
@@ -157,6 +186,178 @@ class Repository:
             ).fetchone()
         return int(row["n"])
 
+    def create_handover(self, outgoing_officer: str, incoming_officer: str,
+                        reservoir_level: float, personnel: List[str],
+                        note: Optional[str], item_ids: List[int],
+                        actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            rows = self.conn.execute(
+                f"SELECT id, status, version FROM items WHERE id IN ({','.join('?' for _ in item_ids)})",
+                item_ids,
+            ).fetchall()
+            found = {int(row["id"]): row for row in rows}
+            missing = [i for i in item_ids if i not in found]
+            if missing:
+                raise NotFoundError(f"指令不存在: {missing[0]}")
+            cur = self.conn.execute(
+                """INSERT INTO handovers(outgoing_officer, incoming_officer, reservoir_level,
+                   personnel, note, status, created_by, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (outgoing_officer, incoming_officer, reservoir_level,
+                 json.dumps(personnel, ensure_ascii=False), note, HANDOVER_STATES[0],
+                 actor, now),
+            )
+            handover_id = int(cur.lastrowid)
+            try:
+                self.conn.executemany(
+                    """INSERT INTO handover_items(handover_id, item_id, item_version, item_status)
+                       VALUES(?,?,?,?)""",
+                    [(handover_id, found[i]["id"], int(found[i]["version"]),
+                      found[i]["status"]) for i in item_ids],
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("存在已登记但尚未确认交接的指令") from exc
+        return self.get_handover(handover_id)
+
+    def get_handover(self, handover_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM handovers WHERE id=?", (handover_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("交接单不存在")
+        return dict(row)
+
+    def list_handovers(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM handovers"
+        params: tuple = ()
+        if status:
+            sql += " WHERE status=?"
+            params = (status,)
+        sql += " ORDER BY id DESC"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_handover_items(self, handover_id: int) -> List[Dict[str, Any]]:
+        self.get_handover(handover_id)
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT hi.*, i.title AS item_title, i.severity AS item_severity
+                   FROM handover_items hi JOIN items i ON i.id=hi.item_id
+                   WHERE hi.handover_id=? ORDER BY hi.id""",
+                (handover_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_handover_item(self, handover_item_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM handover_items WHERE id=?", (handover_item_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("交接明细不存在")
+        return dict(row)
+
+    def open_lock_for_item(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT hi.id AS handover_item_id, hi.handover_id, h.incoming_officer
+                   FROM handover_items hi
+                   JOIN handovers h ON h.id=hi.handover_id
+                   WHERE hi.item_id=? AND hi.decision IS NULL AND h.status='open'""",
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def open_locks_for_items(self, item_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        if not item_ids:
+            return {}
+        with self._lock:
+            rows = self.conn.execute(
+                f"""SELECT hi.item_id AS item_id, hi.id AS handover_item_id,
+                           hi.handover_id, h.incoming_officer
+                    FROM handover_items hi
+                    JOIN handovers h ON h.id=hi.handover_id
+                    WHERE hi.decision IS NULL AND h.status='open'
+                      AND hi.item_id IN ({','.join('?' for _ in item_ids)})""",
+                item_ids,
+            ).fetchall()
+        return {int(row["item_id"]): dict(row) for row in rows}
+
+    def accept_handover_item(self, handover_item_id: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE handover_items SET decision='accepted', reason=NULL,
+                   decided_by=?, decided_at=?
+                   WHERE id=? AND decision IS NULL""",
+                (actor, now, handover_item_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM handover_items WHERE id=?", (handover_item_id,)
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError("交接明细不存在")
+                raise ConflictError("该指令已确认，不能重复操作")
+            row = self.conn.execute(
+                "SELECT handover_id FROM handover_items WHERE id=?", (handover_item_id,)
+            ).fetchone()
+            handover_id = int(row["handover_id"])
+            pending = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM handover_items WHERE handover_id=? AND decision IS NULL",
+                (handover_id,),
+            ).fetchone()
+            if int(pending["n"]) == 0:
+                self.conn.execute(
+                    "UPDATE handovers SET status='completed', completed_at=? WHERE id=? AND status='open'",
+                    (now, handover_id),
+                )
+        return self.get_handover_item(handover_item_id)
+
+    def return_handover_item(self, handover_item_id: int, reason: str,
+                             actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM handover_items WHERE id=?", (handover_item_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("交接明细不存在")
+            if row["decision"] is not None:
+                raise ConflictError("该指令已确认，不能重复操作")
+            item_id = int(row["item_id"])
+            cur = self.conn.execute(
+                """UPDATE items SET status=?, version=version+1, updated_at=?
+                   WHERE id=? AND version=?""",
+                (return_review_state(), now, item_id, int(row["item_version"])),
+            )
+            if cur.rowcount == 0:
+                latest = self.conn.execute(
+                    "SELECT version FROM items WHERE id=?", (item_id,)
+                ).fetchone()
+                if latest is None:
+                    raise NotFoundError("项目不存在")
+                raise ConflictError("版本冲突，请刷新后重试")
+            self.conn.execute(
+                """UPDATE handover_items SET decision='returned', reason=?,
+                   decided_by=?, decided_at=?, item_version=item_version+1,
+                   item_status=? WHERE id=?""",
+                (reason, actor, now, return_review_state(), handover_item_id),
+            )
+            pending = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM handover_items WHERE handover_id=? AND decision IS NULL",
+                (int(row["handover_id"]),),
+            ).fetchone()
+            if int(pending["n"]) == 0:
+                self.conn.execute(
+                    "UPDATE handovers SET status='completed', completed_at=? WHERE id=? AND status='open'",
+                    (now, int(row["handover_id"])),
+                )
+        return self.get_handover_item(handover_item_id)
+
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
         with self._lock, self.conn:
@@ -176,12 +377,19 @@ class Repository:
         event["id"] = event_id
         return event
 
-    def list_audit(self, entity_id: Optional[int] = None) -> List[Dict[str, Any]]:
-        sql = "SELECT * FROM audit_events"
-        params: tuple = ()
+    def list_audit(self, entity_id: Optional[int] = None,
+                   entity_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        clauses = []
+        params: List[Any] = []
         if entity_id is not None:
-            sql += " WHERE entity_id=?"
-            params = (entity_id,)
+            clauses.append("entity_id=?")
+            params.append(entity_id)
+        if entity_type is not None:
+            clauses.append("entity_type=?")
+            params.append(entity_type)
+        sql = "SELECT * FROM audit_events"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY id"
         with self._lock:
             rows = self.conn.execute(sql, params).fetchall()

@@ -97,7 +97,27 @@ def make_handler(service: Service, static_dir: str):
                 elif path == "/api/audit":
                     actor, role = self._identity()
                     del actor
-                    self._json(200, {"events": service.audit(role)})
+                    query = parse_qs(urlparse(self.path).query)
+                    entity_type = query.get("entity_type", [None])[0]
+                    self._json(200, {"events": service.audit(
+                        role, entity_type=entity_type)})
+                elif path == "/api/handovers":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    status = query.get("status", [None])[0]
+                    self._json(200, {"handovers": service.list_handovers(role, status)})
+                elif path.startswith("/api/handovers/") and "/items/" in path:
+                    parts = path.split("/")
+                    handover_id = int(parts[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_handover(handover_id, role))
+                elif path.startswith("/api/handovers/"):
+                    handover_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_handover(handover_id, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +139,14 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path == "/api/handovers":
+                    self._json(201, service.register_handover(body, actor, role))
+                elif path.startswith("/api/handovers/") and "/items/" in path:
+                    parts = path.split("/")
+                    handover_id = int(parts[3])
+                    handover_item_id = int(parts[5])
+                    self._json(200, service.decide_handover_item(
+                        handover_id, handover_item_id, body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
