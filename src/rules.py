@@ -4,6 +4,8 @@ TITLE='水库防汛调度与操作确认'; ENTITY='调度指令'; ID_PREFIX='RF'
 SEVERITIES=['routine', 'attention', 'urgent', 'emergency']; STATES=['draft', 'checked', 'authorized', 'executed', 'closed']; TRANSITIONS={'draft': ['checked'], 'checked': ['authorized'], 'authorized': ['executed'], 'executed': ['closed'], 'closed': []}; TRANSITION_ROLES={'checked': ['duty_officer'], 'authorized': ['chief_engineer'], 'executed': ['dispatcher'], 'closed': ['chief_engineer']}
 CREATE_ROLES=set(['duty_officer']); RECORD_ROLES=set(['duty_officer', 'dispatcher']); AUDIT_ROLES=set(['chief_engineer', 'viewer']); VIEW_ROLES=set(['duty_officer', 'chief_engineer', 'dispatcher', 'viewer'])
 SEVERITY_WEIGHT={'routine': 1.0, 'attention': 3.0, 'urgent': 6.0, 'emergency': 9.0}; DEADLINE_HOURS={'routine': 72, 'attention': 24, 'urgent': 8, 'emergency': 4}; TERMINAL_STATES=set(['closed'])
+HANDOVER_ENTITY='交接班'; HANDOVER_STATUS=['pending', 'confirmed']; HANDOVER_DECISIONS=['takeover', 'return']; HANDOVERABLE_STATES=['draft', 'checked', 'authorized']; HANDOVER_RETURN_TARGET='draft'
+HANDOVER_CREATE_ROLES=set(['duty_officer']); HANDOVER_DECIDE_ROLES=set(['duty_officer'])
 def priority_score(severity,quantity=0.0,threshold=1.0,open_records=0):
     if severity not in SEVERITY_WEIGHT: raise ValidationError("unknown severity")
     ratio=quantity/threshold if threshold>0 else 1.0
@@ -20,3 +22,7 @@ def validate_transition(current,target):
     if not can_transition(current,target): raise ConflictError(f"不能从{current}转换到{target}")
 def completion_blockers(target,open_records): return ["仍有未关闭事项"] if target in TERMINAL_STATES and open_records>0 else []
 def role_for_transition(target): return set(TRANSITION_ROLES.get(target,[]))
+def handoverable(status): return status in HANDOVERABLE_STATES
+def handover_return_target(status):
+    if status not in HANDOVERABLE_STATES: raise ConflictError(f"状态{status}不能退回复核")
+    return HANDOVER_RETURN_TARGET

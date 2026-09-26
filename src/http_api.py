@@ -98,6 +98,17 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/handovers":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    status = query.get("status", [None])[0]
+                    self._json(200, {"handovers": service.list_handovers(role, status)})
+                elif path.startswith("/api/handovers/"):
+                    handover_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_handover(handover_id, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -110,6 +121,11 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path == "/api/handovers":
+                    self._json(201, service.create_handover(body, actor, role))
+                elif path.startswith("/api/handovers/") and path.endswith("/decisions"):
+                    handover_id = int(path.split("/")[3])
+                    self._json(200, service.decide_handover(handover_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))

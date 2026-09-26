@@ -20,6 +20,12 @@ class Record:
 @dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
+@dataclass(frozen=True)
+class Handover:
+    id:int; outgoing_actor:str; incoming_actor:str; reservoir_level:float; note:Optional[str]; status:str; created_at:str; confirmed_at:Optional[str]
+@dataclass(frozen=True)
+class HandoverItem:
+    id:int; handover_id:int; item_id:int; decision:str; reason:Optional[str]; decided_by:Optional[str]; decided_at:Optional[str]; created_at:str
 def require_text(value,field,max_length=2000):
     if not isinstance(value,str) or not value.strip(): raise ValidationError(f"{field}不能为空")
     value=value.strip()

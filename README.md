@@ -31,8 +31,16 @@ python3 app.py --db ./data.db --port 8315
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
 - `GET /api/audit`
+- `GET /api/handovers`，可按`?status=pending|confirmed`过滤
+- `POST /api/handovers`，交班人登记接班人、当前库位和未完成指令
+- `GET /api/handovers/{id}`
+- `POST /api/handovers/{id}/decisions`，接班人逐条确认，提交`item_id`、`decision`（`takeover`或`return`），退回必须附`reason`
 
 允许角色：duty_officer, chief_engineer, dispatcher, viewer。库位超过汛限或入库流量上升时提升紧迫度；授权前必须有复核记录，执行后仍要闭环现场反馈。
+
+## 交接确认
+
+换班时由交班值班员（duty_officer）登记交接：接班人、当前库位和未完成指令（`draft`、`checked`、`authorized`状态）。登记后指令立即锁定，禁止状态流转；只有登记的接班人本人能逐条确认：选择`takeover`后指令解锁继续流转；选择`return`必须写明原因，指令退回`draft`重新进入复核，并生成一条待关闭的`handover_return`记录。全部指令确认后交接自动完成。交接记录与指令版本变化按顺序写入同一审计链，原有角色权限和审计校验不变。
 
 ## 测试
 

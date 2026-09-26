@@ -65,6 +65,31 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS handovers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    outgoing_actor TEXT NOT NULL,
+                    incoming_actor TEXT NOT NULL,
+                    reservoir_level REAL NOT NULL,
+                    note TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','confirmed')),
+                    created_at TEXT NOT NULL,
+                    confirmed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS handover_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    handover_id INTEGER NOT NULL REFERENCES handovers(id) ON DELETE CASCADE,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    decision TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(decision IN ('pending','takeover','returned')),
+                    reason TEXT,
+                    decided_by TEXT,
+                    decided_at TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(handover_id, item_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_handover_items_pending
+                    ON handover_items(item_id) WHERE decision='pending';
             """)
 
     @staticmethod
@@ -156,6 +181,101 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def create_handover(self, outgoing_actor: str, incoming_actor: str,
+                        reservoir_level: float, note: Optional[str],
+                        item_ids: List[int]) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO handovers(outgoing_actor, incoming_actor, reservoir_level,
+                       note, status, created_at) VALUES(?,?,?,?,?,?)""",
+                    (outgoing_actor, incoming_actor, reservoir_level, note, "pending", now),
+                )
+                handover_id = int(cur.lastrowid)
+                for item_id in item_ids:
+                    self.conn.execute(
+                        """INSERT INTO handover_items(handover_id, item_id, decision, created_at)
+                           VALUES(?,?,?,?)""",
+                        (handover_id, item_id, "pending", now),
+                    )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("指令已在其他未完成的交接中待确认") from exc
+        return self.get_handover(handover_id)
+
+    def get_handover(self, handover_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM handovers WHERE id=?", (handover_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("交接记录不存在")
+        return dict(row)
+
+    def list_handovers(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM handovers"
+        params: tuple = ()
+        if status:
+            sql += " WHERE status=?"
+            params = (status,)
+        sql += " ORDER BY id DESC"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_handover_items(self, handover_id: int) -> List[Dict[str, Any]]:
+        self.get_handover(handover_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM handover_items WHERE handover_id=? ORDER BY id",
+                (handover_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def decide_handover_item(self, handover_id: int, item_id: int, decision: str,
+                             reason: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE handover_items SET decision=?, reason=?, decided_by=?, decided_at=?
+                   WHERE handover_id=? AND item_id=? AND decision='pending'""",
+                (decision, reason, actor, now, handover_id, item_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM handover_items WHERE handover_id=? AND item_id=?",
+                    (handover_id, item_id),
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError("指令不在该交接中")
+                raise ConflictError("该指令已完成交接确认")
+            row = self.conn.execute(
+                "SELECT * FROM handover_items WHERE handover_id=? AND item_id=?",
+                (handover_id, item_id),
+            ).fetchone()
+        return dict(row)
+
+    def pending_handover_for_item(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT hi.* FROM handover_items hi
+                   JOIN handovers h ON h.id=hi.handover_id
+                   WHERE hi.item_id=? AND hi.decision='pending' AND h.status='pending'""",
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def complete_handover(self, handover_id: int) -> bool:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE handovers SET status='confirmed', confirmed_at=?
+                   WHERE id=? AND status='pending' AND NOT EXISTS (
+                       SELECT 1 FROM handover_items
+                       WHERE handover_id=? AND decision='pending')""",
+                (now, handover_id, handover_id),
+            )
+            return cur.rowcount > 0
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
